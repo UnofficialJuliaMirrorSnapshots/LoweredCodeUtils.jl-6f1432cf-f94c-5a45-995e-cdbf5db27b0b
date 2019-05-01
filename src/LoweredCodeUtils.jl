@@ -1,8 +1,9 @@
 module LoweredCodeUtils
 
-using Core: SimpleVector, CodeInfo, SSAValue
+using Core: SimpleVector, CodeInfo
 using Base.Meta: isexpr
 using JuliaInterpreter
+using JuliaInterpreter: SSAValue, SlotNumber, Frame
 using JuliaInterpreter: @lookup, moduleof, pc_expr, step_expr!, is_global_ref, whichtt,
                         next_until!, finish_and_return!, nstatements, codelocation
 
@@ -36,6 +37,7 @@ function getcallee(stmt)
     error(stmt, " is not a call expression")
 end
 
+ismethod(frame::Frame) = ismethod(pc_expr(frame))
 ismethod(stmt)  = isexpr(stmt, :method)
 ismethod1(stmt) = isexpr(stmt, :method, 1)
 ismethod3(stmt) = isexpr(stmt, :method, 3)
@@ -385,11 +387,33 @@ function methoddef!(@nospecialize(recurse), signatures, frame::Frame, @nospecial
         error("not valid for anonymous methods")
     end
     parentname = get_parentname(name)  # e.g., name = #foo#7 and parentname = foo
-    nextstmt = pc_expr(frame, pc+1)
-    if ismethod1(nextstmt)
-        name = nextstmt.args[1]
+    pcinc = 1
+    nextstmt = pc_expr(frame, pc+pcinc)
+    while ismethod1(nextstmt) || isexpr(nextstmt, :global)
+        if ismethod1(nextstmt)
+            name = nextstmt.args[1]
+        end
+        pcinc += 1
+        nextstmt = pc_expr(frame, pc+pcinc)
     end
-    if name != parentname
+    if !define && String(name)[1] == '#'
+        # We will have to correct the name.
+        # We can only correct one at a time, so work backwards from a non-gensymmed name
+        # (https://github.com/timholy/Revise.jl/issues/290)
+        pc0 = pc
+        idx1 = findall(ismethod1, frame.framecode.src.code)
+        idx1 = idx1[idx1 .>= pc]
+        hashhash = map(idx->startswith(String(pc_expr(frame, idx).args[1]), '#'), idx1)
+        idx1 = idx1[hashhash]
+        i = length(idx1)
+        while i > 1
+            frame.pc = idx1[i]
+            methoddef!(recurse, [], frame, frame.pc; define=define)
+            i -= 1
+        end
+        frame.pc = pc0
+    end
+    if name != parentname && !define
         name, endpc = correct_name!(recurse, frame, pc, name, parentname)
     end
     while true  # methods containing inner methods may need multiple trips through this loop
@@ -397,7 +421,7 @@ function methoddef!(@nospecialize(recurse), signatures, frame::Frame, @nospecial
         stmt = pc_expr(frame, pc)
         while !isexpr(stmt, :method, 3)
             pc = next_or_nothing(frame, pc)  # this should not check define, we've probably already done this once
-            pc === nothing && return pc   # this was just `function foo end`, signal "no def"
+            pc === nothing && return nothing   # this was just `function foo end`, signal "no def"
             stmt = pc_expr(frame, pc)
         end
         pc3 = pc
@@ -464,7 +488,7 @@ function bodymethod(mkw::Method)
         if isa(stmt, Expr)
             if stmt.head == :call
                 a = stmt.args[argno]
-                if isa(a, Core.SlotNumber)
+                if isa(a, SlotNumber)
                     if slotnames[a.id] == Symbol("#self#")
                         return true
                     end
